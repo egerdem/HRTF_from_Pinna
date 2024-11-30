@@ -1,130 +1,203 @@
 import numpy as np
 from scipy.special import sph_harm
+import matplotlib
+from matplotlib.colors import Normalize
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from torch.utils.data import DataLoader
+import tqdm
+from utils import SonicomDatabase
 
-# Convert spherical to Cartesian for plotting
+matplotlib.use('Qt5Agg')  # For PyQt5 or PySide2
+
+# Helper Functions
 def spherical_to_cartesian(r, theta, phi):
     x = r * np.sin(theta) * np.cos(phi)
     y = r * np.sin(theta) * np.sin(phi)
     z = r * np.cos(theta)
     return x, y, z
 
-def spherical_harmonic_decomposition(hrtf, theta, phi, freq_bins, max_order):
+
+def compute_sh_coeff_pseudoinv(hrtf, theta, phi, Nmax):
     """
-    Decompose HRTF into spherical harmonics.
-
-    Parameters:
-    - hrtf: numpy array of shape (num_points, num_freq_bins)
-    - theta: array of elevation angles (num_points)
-    - phi: array of azimuth angles (num_points)
-    - freq_bins: array of frequency bins
-    - max_order: maximum order for spherical harmonics
-
-    Returns:
-    - coeffs: dictionary with keys (n, m) containing arrays of coefficients per frequency bin
+    Compute spherical harmonic coefficients using least squares.
     """
-    num_points, num_freq_bins = hrtf.shape
-    coeffs = {}
+    S = len(theta)  # Number of discrete measurement points
+    shd_len = (Nmax + 1) ** 2  # Total number of SH coefficients
 
-    for n in range(max_order + 1):
+    # Compute spherical harmonics matrix Y
+    Y = np.zeros((S, shd_len), dtype=np.complex128)
+    counter = 0
+    for n in range(Nmax + 1):
         for m in range(-n, n + 1):
-            coeff = np.zeros(num_freq_bins, dtype=complex)
-            for i in range(num_points):
-                Y_nm = sph_harm(m, n, phi[i], theta[i])
-                coeff += hrtf[i, :] * Y_nm * np.sin(theta[i])  # Weight by sin(theta)
-            coeff *= 4 * np.pi / num_points  # Normalize by total sampling points
-            coeffs[(n, m)] = coeff
+            Y[:, counter] = sph_harm(m, n, phi, theta)
+            counter += 1
+
+    # Solve for coefficients using least squares
+    Y_T_Y = np.dot(Y.T, Y)
+    Y_T_f = np.dot(Y.T, hrtf)
+    coeffs = np.linalg.solve(Y_T_Y, Y_T_f)  # Solve the linear system
 
     return coeffs
 
-# Reconstruct the HRTF on the structured grid
-def reconstruct_hrtf_grid(coeffs, theta, phi, max_order, num_freq_bins):
+def reconstruct_hrtf_from_coeffs(coeffs, theta, phi, Nmax):
     """
-    Reconstruct the HRTF at specific sampling points for all frequency bins.
-
-    Parameters:
-    - coeffs: dictionary of spherical harmonic coefficients
-    - theta: 1D array of elevation angles (793 points)
-    - phi: 1D array of azimuth angles (793 points)
-    - max_order: maximum spherical harmonic order
-    - num_freq_bins: number of frequency bins
-
-    Returns:
-    - reconstructed: 2D array of shape (793, num_freq_bins)
+    Reconstruct HRTF values using spherical harmonics coefficients.
     """
-    num_points = len(theta)
-    reconstructed = np.zeros((num_points, num_freq_bins), dtype=complex)
+    P = len(theta)  # Number of points to reconstruct
+    shd_len = (Nmax + 1) ** 2  # Total number of SH coefficients
 
-    for n in range(max_order + 1):
+    # Compute spherical harmonics matrix Y
+    Y = np.zeros((P, shd_len), dtype=np.complex128)
+    counter = 0
+    for n in range(Nmax + 1):
         for m in range(-n, n + 1):
-            Y_nm = sph_harm(m, n, phi, theta)  # Shape: (793,)
-            # Broadcast and add: coeffs[(n, m)] has shape (num_freq_bins,)
-            reconstructed += Y_nm[:, None] * coeffs[(n, m)][None, :]
+            Y[:, counter] = sph_harm(m, n, phi, theta)
+            counter += 1
 
-    return np.real(reconstructed)  # Use real part for visualization
+    # Reconstruct HRTF
+    hrtf_recon = np.dot(Y, coeffs)  # Multiply Y and c
+    return hrtf_recon  # Take magnitude if needed
 
-# Example parameters
-num_points = 793
-num_freq_bins = 129
-max_order = 20  # Choose based on desired accuracy
-freq_bin_idx = 20
+def shd_decomposition_direct(hrtf_demo, phi_deg, theta_deg, Nmax):
+    """
+    Direct SH decomposition method for comparison.
+    """
+    shd_len = (Nmax + 1) ** 2
+    Ynm = np.zeros((shd_len, len(theta_deg)), dtype=np.complex128)
+    for n in range(Nmax + 1):
+        for m in range(-n, n + 1):
+            idx = n**2 + n + m
+            Ynm[idx, :] = sph_harm(m, n, np.deg2rad(phi_deg), np.deg2rad(theta_deg))
 
-theta = np.linspace(0, np.pi, num_points)  # Example elevation angles
-phi = np.linspace(0, 2 * np.pi, num_points)  # Example azimuth angles
-hrtf = np.random.rand(num_points, num_freq_bins)  # Example HRTF data
-freq_bins = np.linspace(0, 8000, num_freq_bins)  # Example frequency bins (0-8 kHz)
+    coeffs = hrtf_demo.T @ Ynm.T  # Compute coefficients
+    return coeffs, Ynm
 
-# Perform decomposition
-coeffs = spherical_harmonic_decomposition(hrtf, theta, phi, freq_bins, max_order)
+def compute_weighted_error(hrtf_true, hrtf_predicted):
+    """
+    Compute weighted error in dB between true and predicted HRTF magnitudes.
+    """
 
-# Access coefficients for specific (n, m)
-n, m = 2, 1
-print(f"Spherical harmonic coefficients for order {n}, degree {m}: {coeffs[(n, m)]}")
+    weighted_error = np.mean((np.abs(hrtf_true) - np.abs(hrtf_predicted)) ** 2)
+    return 10. * np.log10(weighted_error)  # Return error in dB
 
+# Main Code
+sonicom_root = './data'
+sd = SonicomDatabase(sonicom_root, training_data=True, folder_structure='v2')
+train_dataloader = DataLoader(sd, batch_size=1, shuffle=False)
 
-# Generate structured grid for the sphere
-phi_grid, theta_grid = np.meshgrid(
-    np.linspace(0, 2 * np.pi, num_points),  # Azimuth angles
-    np.linspace(0, np.pi, num_points)        # Elevation angles
-)
+# Load data and extract HRTF
+for i, (images, hrtf) in tqdm.tqdm(enumerate(train_dataloader)):
+    print(f'Image size: {images.shape} and HRTF size: {hrtf.shape}')
+    break
 
+# Extract HRTF and positional data
+Fbin = 100
+hrtf_demo = hrtf[0, :, 0, :].numpy()  # 793, 129
 
+# hrtf = hrtf_demo[:, Fbin]
+# hrtf_normalized = hrtf / np.max(np.abs(hrtf))
+# Take the magnitude (abs) of the HRTF
+hrtf_demo_magnitude = np.abs(hrtf_demo)
+hrtf_magnitude = np.abs(hrtf_demo[:, Fbin])  # Only use magnitude for decomposition
+hrtf_complex = hrtf_demo[:, Fbin]  # Only use magnitude for decomposition
 
+# hrtf_complex_magnitude_normalized = hrtf_complex / np.max(hrtf_complex)  # Normalize to [0, 1]
+hrtf_magnitude_normalized = hrtf_magnitude / np.max(hrtf_magnitude)  # Normalize to [0, 1]
 
-# Reconstruct on the grid
-reconstructed_grid = reconstruct_hrtf_grid(coeffs, theta, phi, max_order, num_freq_bins)
+phi_sonicom_deg, teta_sonicom_deg, r = sd.position[:, 0], sd.position[:, 1], sd.position[:, 2]
+teta_scipy_deg = 90 - teta_sonicom_deg  # Adjust to scipy convention
+phi_scipy_deg = phi_sonicom_deg
 
-# Convert spherical to Cartesian for grid
-x_grid = np.sin(theta_grid) * np.cos(phi_grid)
-y_grid = np.sin(theta_grid) * np.sin(phi_grid)
-z_grid = np.cos(theta_grid)
+# SHD decomposition with
+Nmax = 9  # Maximum SH order
+theta_rad = np.deg2rad(teta_scipy_deg)  # Elevation angles in radians
+phi_rad = np.deg2rad(phi_scipy_deg)  # Azimuth angles in radians
 
-# Plot HRTF on the sphere
-fig = plt.figure(figsize=(8, 6))
+# Method 1: SHD Decomposition with Direct Method
+# coeffs_direct, Ynm_direct = shd_decomposition_direct(hrtf_magnitude_normalized, phi_scipy_deg, teta_scipy_deg, Nmax)
+# Reconstruction using Method 1
+# reconstructed_hrtf_direct = np.dot(Ynm_direct.T, coeffs_direct.T).T  # Shape: (F, P)
+# hrtf_recon_direct_normalized = reconstructed_hrtf_direct / np.max(reconstructed_hrtf_direct)
+
+# Method 2: SHD Decomposition with Pseudoinverse
+coeffs_pseudoinv = compute_sh_coeff_pseudoinv(hrtf_magnitude_normalized, theta_rad, phi_rad, Nmax)
+
+# Reconstruction using Method 2
+reconstructed_hrtf_pseudoinv = reconstruct_hrtf_from_coeffs(coeffs_pseudoinv, theta_rad, phi_rad, Nmax)
+reconstructed_hrtf_pseudoinv_normalized = reconstructed_hrtf_pseudoinv / np.max(np.abs(reconstructed_hrtf_pseudoinv))  # Normalize to [0, 1]
+
+# Visualization of original and reconstructed HRTFs
+x, y, z = spherical_to_cartesian(1.5, theta_rad, phi_rad)
+
+# Original HRTF plot
+fig = plt.figure(figsize=(10, 8))
 ax = fig.add_subplot(111, projection='3d')
-surf = ax.plot_surface(
-    x_grid, y_grid, z_grid, facecolors=plt.cm.viridis(reconstructed_grid),
-    rstride=1, cstride=1, antialiased=False, shade=False
-)
-ax.set_title('HRTF on Sphere')
-ax.set_xlabel('X (m)')
-ax.set_ylabel('Y (m)')
-ax.set_zlabel('Z (m)')
-plt.colorbar(plt.cm.ScalarMappable(cmap='viridis'), ax=ax, shrink=0.5, aspect=10)
+sc = ax.scatter(x, y, z, c=hrtf_magnitude_normalized, cmap='viridis', s=20)
+plt.colorbar(sc, ax=ax, label="HRTF Values")
+ax.set_title("Original HRTF Magnitude")
 plt.show()
 
-# Plot HRTF on the sphere
-fig = plt.figure(figsize=(8, 6))
+# Reconstructed HRTF plot
+# fig = plt.figure(figsize=(10, 8))
+# ax = fig.add_subplot(111, projection='3d')
+# sc = ax.scatter(x, y, z, c=hrtf_recon_direct_normalized, cmap='viridis', s=20)
+# plt.colorbar(sc, ax=ax, label="HRTF Values")
+# ax.set_title("Reconstructed HRTF Magnitude (Direct SHD)")
+# plt.show()
+
+# Reconstructed HRTF plot
+fig = plt.figure(figsize=(10, 8))
 ax = fig.add_subplot(111, projection='3d')
-surf = ax.plot_surface(
-    x_grid, y_grid, z_grid, facecolors=plt.cm.viridis(hrtf),
-    rstride=1, cstride=1, antialiased=False, shade=False
-)
-ax.set_title('HRTF on Sphere')
-ax.set_xlabel('X (m)')
-ax.set_ylabel('Y (m)')
-ax.set_zlabel('Z (m)')
-plt.colorbar(plt.cm.ScalarMappable(cmap='viridis'), ax=ax, shrink=0.5, aspect=10)
+sc = ax.scatter(x, y, z, c=np.abs(reconstructed_hrtf_pseudoinv_normalized), cmap='viridis', s=20)
+plt.colorbar(sc, ax=ax, label="HRTF Values")
+ax.set_title("Reconstructed HRTF Magnitude (SHD)")
+plt.show()
+
+# Compute reconstruction error
+mse = np.mean((hrtf_magnitude_normalized - reconstructed_hrtf_pseudoinv_normalized)**2)
+print(f"Reconstruction MSE: {mse}")
+
+# Initialize parameters
+bin_range = hrtf_demo.shape[1]
+selected_bins = range(bin_range)  # Use all frequency bins for comparison
+N_values = [1, 4, 8, 12]  # Example values of Nmax for comparison
+errors_by_N = {}
+
+# Loop through different values of Nmax
+for Nmax in N_values:
+    print(f"Processing for Nmax = {Nmax}...")
+    # Compute SH coefficients for all bins
+    coeffs_pseudoinv = []
+    for Fbin in range(bin_range):  # Loop over frequency bins
+        coeffs = compute_sh_coeff_pseudoinv(hrtf_demo_magnitude[:, Fbin], theta_rad, phi_rad, Nmax)
+        coeffs_pseudoinv.append(coeffs)
+    coeffs_pseudoinv = np.array(coeffs_pseudoinv)  # Shape: (129, (Nmax+1)^2)
+
+    # Reconstruct HRTFs for all bins
+    reconstructed_hrtf_all_bins = []
+    for Fbin, coeffs in enumerate(coeffs_pseudoinv):
+        reconstructed_hrtf = reconstruct_hrtf_from_coeffs(coeffs, theta_rad, phi_rad, Nmax)
+        reconstructed_hrtf_all_bins.append(reconstructed_hrtf)
+    reconstructed_hrtf_all_bins = np.array(reconstructed_hrtf_all_bins).T  # Shape: (793, 129)
+
+    # Compute weighted errors for specific bins
+    errors_db = []
+    for Fbin in selected_bins:
+        error = compute_weighted_error(hrtf_demo_magnitude[:, Fbin], reconstructed_hrtf_all_bins[:, Fbin])
+        errors_db.append(error)
+
+    # Store errors for the current Nmax
+    errors_by_N[Nmax] = errors_db
+
+# Plot errors for all N values across frequency bins
+plt.figure(figsize=(12, 8))
+for Nmax, errors_db in errors_by_N.items():
+    plt.plot(selected_bins, errors_db, label=f"Nmax = {Nmax}")
+
+plt.title("Reconstruction Error Across Frequency Bins for Different Nmax")
+plt.xlabel("Frequency Bin")
+plt.ylabel("MSE Error (dB)")
+plt.legend()
+plt.grid(True)
 plt.show()
 
