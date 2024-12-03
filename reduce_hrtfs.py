@@ -20,6 +20,14 @@ def load(file_name):
     print("%s is loaded " % file_name)
     return data
 
+def sph_harm_real(m, n, phi, theta):
+
+    if m > 0:
+        return np.sqrt(2) * (-1) ** m * np.real(sph_harm(m, n, phi, theta))
+    elif m < 0:
+        return np.sqrt(2) * (-1) ** m * np.imag(sph_harm(-m, n, phi, theta))
+    else:  # m == 0
+        return sph_harm(0, n, phi, theta).real
 def spherical_to_cartesian(r, theta, phi):
     x = r * np.sin(theta) * np.cos(phi)
     y = r * np.sin(theta) * np.sin(phi)
@@ -38,7 +46,7 @@ def compute_sh_coeff_pseudoinv(hrtf, theta, phi, Nmax):
     counter = 0
     for n in range(Nmax + 1):
         for m in range(-n, n + 1):
-            Y[:, counter] = sph_harm(m, n, phi, theta)
+            Y[:, counter] = sph_harm_real(m, n, phi, theta)
             counter += 1
 
     # Solve for coefficients using least squares
@@ -70,7 +78,7 @@ def construct_reduced_hrtf_with_pseudoinv(hrtf, theta_rad, phi_rad, Nmax):
     shd_len = (Nmax + 1) ** 2  # Number of spherical harmonic coefficients
 
     # Initialize the reduced HRTF tensor
-    hrtf_reduced = np.zeros((shd_len, num_ears, num_bins), dtype=np.complex128)
+    hrtf_reduced = np.zeros((shd_len, num_ears, num_bins))
 
     # Iterate over ears (2 for left and right)
     for ear in range(num_ears):
@@ -91,12 +99,13 @@ def construct_reduced_hrtf_with_pseudoinv(hrtf, theta_rad, phi_rad, Nmax):
 
 # Main Code
 sonicom_root = './data'
-sd = SonicomDatabase(sonicom_root, training_data=True, folder_structure='v2')
+sd = SonicomDatabase(sonicom_root, training_data=False, folder_structure='v2')
 
 # Load data and extract HRTF
 
-def process_hrtfs(sd, Nmax, output_dir="./reduced_hrtf_sofa_files"):
+def process_hrtfs(sd, Nmax):
 
+    output_dir = f"./reduced_hrtf_N{Nmax}"
     os.makedirs(output_dir, exist_ok=True)
 
     train_dataloader = DataLoader(sd, batch_size=1, shuffle=False)
@@ -120,19 +129,19 @@ def process_hrtfs(sd, Nmax, output_dir="./reduced_hrtf_sofa_files"):
         hrtf_reduced = construct_reduced_hrtf_with_pseudoinv(hrtf_dem_rl, theta_scipy_rad, phi_scipy_rad, Nmax)
 
         # Construct SOFA file path
-        filename = f"{subject_name}_N{Nmax}_reduced"
+        filename = f"{subject_name}_N{Nmax}_SH"
         output_path = os.path.join(output_dir, filename)
 
         # Save to SOFA file
         dump(output_path, hrtf_reduced)
 
-        if i== 5:git remote add origin https://github.com/egerdem/HRTF_SHD_Analysis.git
-
-            break
+        # if i== 1:
+        #     break
 
     return (hrtf_reduced)
 
 hrtf_reduced = process_hrtfs(sd, Nmax=7)
+
 
 # Output shape
 print(f"Reduced HRTF tensor shape: {hrtf_reduced.shape}")  # Should print: ((Nmax+1)^2, 2, 129)

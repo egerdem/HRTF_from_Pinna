@@ -9,9 +9,7 @@ import torch
 import tqdm
 from metrics import MeanSpectralDistortion
 
-
 all_tasks = [np.arange(19).tolist(), np.arange(19, step=3).tolist(), [3, 6, 9]]
-
 
 class SonicomDatabase(torch.utils.data.Dataset):
 
